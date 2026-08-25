@@ -1,0 +1,277 @@
+!pip install yfinance pandas matplotlib --quiet
+
+import yfinance as yf
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+
+TICKERS = ["BABA", "LIN", "NVO", "CVX", "ASML", "MU"]
+
+
+WEIGHTS = {
+    "pe": 10,
+    "pb": 8,
+    "roe": 12,
+    "gross_margin": 8,
+    "de_ratio": 10,
+    "altman_z": 14,
+    "piotroski": 14,
+    "beneish_m": 12,
+    "eps_growth": 6,
+    "revenue_growth": 6,
+}
+
+
+
+def get_row(statement, label, alt_labels=None):
+   
+    if statement is None or statement.empty:
+        return None
+    for name in [label] + (alt_labels or []):
+        if name in statement.index:
+            return statement.loc[name].dropna()
+    return None
+
+
+def pct(value):
+    
+    if value is None:
+        return None
+    return value * 100 if abs(value) < 2 else value
+
+
+def get_altman_z(info, balance_sheet, income_stmt):
+    """Estimates bankruptcy risk. Above 3 = safe, below 1.8 = warning sign."""
+    try:
+        ta = get_row(balance_sheet, "Total Assets").iloc[0]
+        ca = get_row(balance_sheet, "Current Assets").iloc[0]
+        cl = get_row(balance_sheet, "Current Liabilities").iloc[0]
+        re = get_row(balance_sheet, "Retained Earnings").iloc[0]
+        equity = get_row(balance_sheet, "Total Stockholder Equity", ["Stockholders Equity"]).iloc[0]
+        ebit = get_row(income_stmt, "EBIT", ["Operating Income"]).iloc[0]
+        sales = get_row(income_stmt, "Total Revenue").iloc[0]
+        market_cap = info.get("marketCap")
+        total_liabilities = ta - equity
+
+        z = (1.2 * (ca - cl) / ta
+             + 1.4 * re / ta
+             + 3.3 * ebit / ta
+             + 0.6 * market_cap / total_liabilities
+             + 1.0 * sales / ta)
+        return round(z, 2)
+    except Exception:
+        return None
+
+
+def get_piotroski(income_stmt, balance_sheet, cashflow):
+    """0-9 score checking whether the business is actually improving
+    year over year. Higher is better."""
+    try:
+        ni = get_row(income_stmt, "Net Income")
+        ta = get_row(balance_sheet, "Total Assets")
+        cfo = get_row(cashflow, "Operating Cash Flow", ["Total Cash From Operating Activities"])
+        debt = get_row(balance_sheet, "Long Term Debt")
+        ca = get_row(balance_sheet, "Current Assets")
+        cl = get_row(balance_sheet, "Current Liabilities")
+        gp = get_row(income_stmt, "Gross Profit")
+        sales = get_row(income_stmt, "Total Revenue")
+
+        checks = [ni, ta, cfo, debt, ca, cl, gp, sales]
+        if any(c is None or len(c) < 2 for c in checks):
+            return None
+
+        score = 0
+        score += ni.iloc[0] > 0
+        score += cfo.iloc[0] > 0
+        score += (ni.iloc[0] / ta.iloc[0]) > (ni.iloc[1] / ta.iloc[1])
+        score += cfo.iloc[0] > ni.iloc[0]
+        score += (debt.iloc[0] / ta.iloc[0]) < (debt.iloc[1] / ta.iloc[1])
+        score += (ca.iloc[0] / cl.iloc[0]) > (ca.iloc[1] / cl.iloc[1])
+        score += (gp.iloc[0] / sales.iloc[0]) > (gp.iloc[1] / sales.iloc[1])
+        score += (sales.iloc[0] / ta.iloc[0]) > (sales.iloc[1] / ta.iloc[1])
+        score += 1  
+        return int(score)
+    except Exception:
+        return None
+
+
+def get_beneish_m(balance_sheet, income_stmt, cashflow):
+    """Flags possible earnings manipulation.""" 
+    try:
+        recv = get_row(balance_sheet, "Receivables", ["Accounts Receivable"])
+        sales = get_row(income_stmt, "Total Revenue")
+        gp = get_row(income_stmt, "Gross Profit")
+        ca = get_row(balance_sheet, "Current Assets")
+        ppe = get_row(balance_sheet, "Net PPE")
+        ta = get_row(balance_sheet, "Total Assets")
+        dep = get_row(cashflow, "Depreciation And Amortization", ["Depreciation"])
+        sga = get_row(income_stmt, "Selling General And Administration")
+        debt = get_row(balance_sheet, "Total Debt")
+        ni = get_row(income_stmt, "Net Income")
+        cfo = get_row(cashflow, "Operating Cash Flow", ["Total Cash From Operating Activities"])
+
+        rows = [recv, sales, gp, ca, ppe, ta, dep, sga, debt, ni, cfo]
+        if any(r is None or len(r) < 2 for r in rows):
+            return None
+
+        dsri = (recv.iloc[0] / sales.iloc[0]) / (recv.iloc[1] / sales.iloc[1])
+        gmi = (gp.iloc[1] / sales.iloc[1]) / (gp.iloc[0] / sales.iloc[0])
+        aqi = (1 - (ca.iloc[0] + ppe.iloc[0]) / ta.iloc[0]) / (1 - (ca.iloc[1] + ppe.iloc[1]) / ta.iloc[1])
+        sgi = sales.iloc[0] / sales.iloc[1]
+        depi = (dep.iloc[1] / (dep.iloc[1] + ppe.iloc[1])) / (dep.iloc[0] / (dep.iloc[0] + ppe.iloc[0]))
+        sgai = (sga.iloc[0] / sales.iloc[0]) / (sga.iloc[1] / sales.iloc[1])
+        lvgi = (debt.iloc[0] / ta.iloc[0]) / (debt.iloc[1] / ta.iloc[1])
+        tata = (ni.iloc[0] - cfo.iloc[0]) / ta.iloc[0]
+
+        m = (-4.84 + 0.92 * dsri + 0.528 * gmi + 0.404 * aqi + 0.892 * sgi
+             + 0.115 * depi - 0.172 * sgai + 4.679 * tata - 0.327 * lvgi)
+        return round(m, 2)
+    except Exception:
+        return None
+
+
+def get_growth_rates(income_stmt):
+    """How fast profit and revenue have grown, annualized."""
+    eps_growth, rev_growth = None, None
+    try:
+        ni = get_row(income_stmt, "Net Income")
+        if ni is not None and len(ni) >= 2 and ni.iloc[-1] > 0:
+            years = len(ni) - 1
+            eps_growth = ((ni.iloc[0] / ni.iloc[-1]) ** (1 / years) - 1) * 100
+    except Exception:
+        pass
+    try:
+        rev = get_row(income_stmt, "Total Revenue")
+        if rev is not None and len(rev) >= 2 and rev.iloc[-1] > 0:
+            years = len(rev) - 1
+            rev_growth = ((rev.iloc[0] / rev.iloc[-1]) ** (1 / years) - 1) * 100
+    except Exception:
+        pass
+    return eps_growth, rev_growth
+
+
+def get_raw_metrics(ticker):
+    """Pulls everything needed for one stock."""
+    t = yf.Ticker(ticker)
+    info = t.info
+    balance_sheet = t.balance_sheet
+    income_stmt = t.financials
+    cashflow = t.cashflow
+
+    eps_growth, rev_growth = get_growth_rates(income_stmt)
+    equity = get_row(balance_sheet, "Total Stockholder Equity", ["Stockholders Equity"])
+    debt = info.get("totalDebt")
+
+    return {
+        "ticker": ticker,
+        "name": info.get("shortName", ticker),
+        "pe": info.get("trailingPE"),
+        "pb": info.get("priceToBook"),
+        "roe": pct(info.get("returnOnEquity")),
+        "gross_margin": pct(info.get("grossMargins")),
+        "de_ratio": (debt / equity.iloc[0]) if debt and equity is not None else None,
+        "altman_z": get_altman_z(info, balance_sheet, income_stmt),
+        "piotroski": get_piotroski(income_stmt, balance_sheet, cashflow),
+        "beneish_m": get_beneish_m(balance_sheet, income_stmt, cashflow),
+        "eps_growth": eps_growth,
+        "revenue_growth": rev_growth,
+    }
+
+
+
+def score_low_is_good(value, best, worst):
+    """For metrics where LOWER is better (like P/E)."""
+    if value is None or value <= 0:
+        return None
+    if value <= best:
+        return 10
+    if value >= worst:
+        return 1
+    return round(10 - 9 * (value - best) / (worst - best), 1)
+
+
+def score_high_is_good(value, worst, best):
+    """For metrics where HIGHER is better (like ROE)."""
+    if value is None:
+        return None
+    if value >= best:
+        return 10
+    if value <= worst:
+        return 1
+    return round(1 + 9 * (value - worst) / (best - worst), 1)
+
+
+def score_all(raw):
+    return {
+        "pe": score_low_is_good(raw["pe"], best=8, worst=50),
+        "pb": score_low_is_good(raw["pb"], best=0.5, worst=6),
+        "roe": score_high_is_good(raw["roe"], worst=0, best=25),
+        "gross_margin": score_high_is_good(raw["gross_margin"], worst=0, best=60),
+        "de_ratio": score_low_is_good(raw["de_ratio"], best=0.1, worst=3),
+        "altman_z": score_high_is_good(raw["altman_z"], worst=1, best=3.5),
+        "piotroski": score_high_is_good(raw["piotroski"], worst=0, best=9),
+        "beneish_m": score_low_is_good(raw["beneish_m"], best=-2.5, worst=1),
+        "eps_growth": score_high_is_good(raw["eps_growth"], worst=-10, best=25),
+        "revenue_growth": score_high_is_good(raw["revenue_growth"], worst=-10, best=20),
+    }
+
+
+def composite_score(scores):
+    """Weighted average of whatever metrics we actually have. A stock
+    isn't punished just because one metric was missing — we rescale
+    the weights to only what's available."""
+    weighted_sum, available_weight = 0, 0
+    for metric, weight in WEIGHTS.items():
+        s = scores.get(metric)
+        if s is not None:
+            weighted_sum += s * weight
+            available_weight += weight
+    if available_weight == 0:
+        return None, 0
+    coverage = available_weight / sum(WEIGHTS.values())
+    return round(weighted_sum / available_weight, 2), round(coverage, 2)
+
+
+
+def run(tickers):
+    results = []
+    for ticker in tickers:
+        print(f"Fetching {ticker}...")
+        try:
+            raw = get_raw_metrics(ticker)
+            scores = score_all(raw)
+            composite, coverage = composite_score(scores)
+            results.append({
+                "ticker": ticker,
+                "name": raw["name"],
+                "composite_score": composite,
+                "data_coverage": coverage,
+            })
+        except Exception as e:
+            print(f"  Couldn't score {ticker}: {e}")
+
+    df = pd.DataFrame(results).sort_values("composite_score", ascending=False)
+    print("\n" + df.to_string(index=False))
+    return df
+
+
+def plot_scores(df):
+    plot_df = df.dropna(subset=["composite_score"]).sort_values("composite_score")
+    colors = ["#d64545" if s < 5 else "#e0a72e" if s < 7 else "#3a9d5c"
+              for s in plot_df["composite_score"]]
+    plt.figure(figsize=(8, max(3, 0.4 * len(plot_df))))
+    plt.barh(plot_df["ticker"], plot_df["composite_score"], color=colors)
+    plt.xlim(0, 10)
+    plt.xlabel("Composite Score (0-10)")
+    plt.title("Stock Scores — Financial Strength")
+    plt.axvline(5, color="grey", linestyle="--", linewidth=0.7)
+    for i, score in enumerate(plot_df["composite_score"]):
+        plt.text(score + 0.1, i, f"{score:.1f}", va="center")
+    plt.tight_layout()
+    plt.show()
+
+
+
+df = run(TICKERS)
+plot_scores(df)
